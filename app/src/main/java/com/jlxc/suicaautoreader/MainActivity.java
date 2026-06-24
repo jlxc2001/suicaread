@@ -10,7 +10,6 @@ import android.os.Build;
 import android.os.Bundle;
 import android.provider.Settings;
 import android.view.Gravity;
-import android.view.View;
 import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
@@ -23,20 +22,16 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 public class MainActivity extends Activity implements NfcAdapter.ReaderCallback {
     private static final String PREFS = "suica_auto_reader_prefs";
-    private static final String KEY_AUTO_OPEN_NFC_SETTINGS = "auto_open_nfc_settings";
-    private static final String KEY_ROOT_NFC_TOGGLE = "root_nfc_toggle";
     private static final String KEY_PAUSE_AFTER_READ = "pause_after_read";
 
     private NfcAdapter nfcAdapter;
     private SharedPreferences prefs;
     private final AtomicBoolean reading = new AtomicBoolean(false);
-    private boolean openedNfcSettingsThisResume = false;
 
     private TextView statusText;
     private TextView balanceText;
     private TextView idmText;
     private LinearLayout historyList;
-    private Button refreshButton;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -45,21 +40,20 @@ public class MainActivity extends Activity implements NfcAdapter.ReaderCallback 
         ensureDefaultPrefs();
         nfcAdapter = NfcAdapter.getDefaultAdapter(this);
         buildUi();
-        handleIntent(getIntent());
+        handleIntent(getIntent(), true);
     }
 
     @Override
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
         setIntent(intent);
-        handleIntent(intent);
+        handleIntent(intent, true);
     }
 
     @Override
     protected void onResume() {
         super.onResume();
-        openedNfcSettingsThisResume = false;
-        startNfcReading();
+        startNfcReading(false);
     }
 
     @Override
@@ -70,57 +64,53 @@ public class MainActivity extends Activity implements NfcAdapter.ReaderCallback 
 
     @Override
     public void onTagDiscovered(Tag tag) {
+        readTag(tag, "Reader Mode 已扫到卡片，正在读取 Suica 余额和履历…");
+    }
+
+    private void handleIntent(Intent intent, boolean fromSystemDispatch) {
+        if (intent == null) return;
+        Tag tag = intent.getParcelableExtra(NfcAdapter.EXTRA_TAG);
+        if (tag != null) {
+            String action = intent.getAction();
+            String source = fromSystemDispatch
+                    ? "由系统 NFC 选择器启动：" + (action == null ? "" : action) + "。正在重新读取卡内数据…"
+                    : "正在读取卡内数据…";
+            readTag(tag, source);
+        }
+    }
+
+    private void readTag(Tag tag, String message) {
+        if (tag == null) return;
         if (!reading.compareAndSet(false, true)) return;
-        runOnUiThread(() -> setStatus("已扫到卡片，正在读取 Suica 余额和履历…"));
+        runOnUiThread(() -> setStatus(message));
         try {
             final SuicaReader.SuicaData data = SuicaReader.read(tag);
             runOnUiThread(() -> {
                 renderSuicaData(data);
                 if (prefs.getBoolean(KEY_PAUSE_AFTER_READ, true)) {
                     stopNfcReading();
-                    setStatus("读取完成。因为卡片贴在手机背面，已暂停扫描，避免反复触发。需要更新时点“重新读取”。");
+                    setStatus("读取完成。已暂停前台连续扫描。下次可以直接重新贴近/重新扫卡，在系统弹出的 App 选择器里选择本软件；也可以点“重新读取”。");
                 } else {
-                    setStatus("读取完成，继续等待下一次 NFC 扫描。");
+                    setStatus("读取完成，继续等待下一次 NFC 扫描。下次从系统 App 选择器打开本软件时，也会自动重新读取。 ");
                 }
             });
         } catch (Exception e) {
-            runOnUiThread(() -> setStatus("读取失败：" + e.getMessage()));
+            runOnUiThread(() -> setStatus("读取失败：" + e.getMessage() + "\n\n可以点“重新读取”，或退出后重新扫卡，在系统弹出的 App 选择器里再次选择本软件。"));
         } finally {
             reading.set(false);
         }
     }
 
-    private void handleIntent(Intent intent) {
-        if (intent == null) return;
-        Tag tag = intent.getParcelableExtra(NfcAdapter.EXTRA_TAG);
-        if (tag != null) {
-            onTagDiscovered(tag);
-        }
-    }
-
-    private void startNfcReading() {
+    private void startNfcReading(boolean userRequested) {
         if (nfcAdapter == null) {
-            setStatus("这台设备没有 NFC 硬件，无法读取 Suica。 ");
+            setStatus("这台设备没有 NFC 硬件，无法读取 Suica。");
             return;
         }
 
         if (!nfcAdapter.isEnabled()) {
-            if (prefs.getBoolean(KEY_ROOT_NFC_TOGGLE, false)) {
-                boolean ok = RootNfc.tryToggle("enable");
-                if (ok) {
-                    setStatus("已尝试通过 root 开启 NFC，正在等待系统刷新状态…");
-                    try { Thread.sleep(700); } catch (InterruptedException ignored) {}
-                }
-            }
-
-            if (!nfcAdapter.isEnabled()) {
-                setStatus("NFC 当前关闭。普通第三方 App 不能直接开启 NFC，只能跳转到系统 NFC 设置页。打开 NFC 后回到本 App 会自动读取。 ");
-                if (prefs.getBoolean(KEY_AUTO_OPEN_NFC_SETTINGS, true) && !openedNfcSettingsThisResume) {
-                    openedNfcSettingsThisResume = true;
-                    openNfcSettings();
-                }
-                return;
-            }
+            setStatus("NFC 当前关闭。普通第三方 App 不能直接打开 NFC。\n\n本版本采用系统选择器模式：请先手动打开 NFC；之后扫到背后的 Suica 时，在系统弹出的 App 选择器里选择 Suica Auto Reader，本软件会收到系统传入的卡片对象并重新读取余额/履历。");
+            if (userRequested) openNfcSettings();
+            return;
         }
 
         Bundle extras = new Bundle();
@@ -128,7 +118,11 @@ public class MainActivity extends Activity implements NfcAdapter.ReaderCallback 
         int flags = NfcAdapter.FLAG_READER_NFC_F | NfcAdapter.FLAG_READER_SKIP_NDEF_CHECK;
         try {
             nfcAdapter.enableReaderMode(this, this, flags, extras);
-            setStatus("等待读取：请保持背后的 Suica 贴近手机 NFC 感应区。你的场景里卡片已经固定在背面，通常打开 App 后会自动扫到。 ");
+            if (userRequested) {
+                setStatus("已重新进入前台读取模式。请保持 Suica 靠近手机 NFC 感应区；如果没有反应，可以稍微移开再贴回。 ");
+            } else {
+                setStatus("等待 NFC：你也可以直接从系统 NFC App 选择器启动本软件，启动后会自动读取系统传入的 Suica 标签。 ");
+            }
         } catch (Exception e) {
             setStatus("启动 NFC Reader Mode 失败：" + e.getMessage());
         }
@@ -150,32 +144,16 @@ public class MainActivity extends Activity implements NfcAdapter.ReaderCallback 
         }
     }
 
-    private void closeNfcAndExit() {
+    private void exitApp() {
         stopNfcReading();
-        if (nfcAdapter != null && nfcAdapter.isEnabled()) {
-            if (prefs.getBoolean(KEY_ROOT_NFC_TOGGLE, false)) {
-                boolean ok = RootNfc.tryToggle("disable");
-                Toast.makeText(this, ok ? "已尝试通过 root 关闭 NFC" : "root 关闭 NFC 失败", Toast.LENGTH_SHORT).show();
-            } else {
-                Toast.makeText(this, "普通 App 不能直接关闭 NFC，已打开系统 NFC 设置页", Toast.LENGTH_LONG).show();
-                openNfcSettings();
-            }
-        }
-        finishAndRemoveTaskCompat();
-    }
-
-    private void finishAndRemoveTaskCompat() {
+        Toast.makeText(this, "已退出，不关闭系统 NFC", Toast.LENGTH_SHORT).show();
         if (Build.VERSION.SDK_INT >= 21) finishAndRemoveTask();
         else finish();
     }
 
     private void ensureDefaultPrefs() {
-        if (!prefs.contains(KEY_AUTO_OPEN_NFC_SETTINGS)) {
-            prefs.edit()
-                    .putBoolean(KEY_AUTO_OPEN_NFC_SETTINGS, true)
-                    .putBoolean(KEY_ROOT_NFC_TOGGLE, false)
-                    .putBoolean(KEY_PAUSE_AFTER_READ, true)
-                    .apply();
+        if (!prefs.contains(KEY_PAUSE_AFTER_READ)) {
+            prefs.edit().putBoolean(KEY_PAUSE_AFTER_READ, true).apply();
         }
     }
 
@@ -183,7 +161,7 @@ public class MainActivity extends Activity implements NfcAdapter.ReaderCallback 
         int pad = dp(16);
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(pad, dp(10), pad, pad);
+        root.setPadding(pad, dp(10) + getStatusBarHeight(), pad, pad);
         root.setBackgroundColor(0xFFF7F8FA);
 
         LinearLayout topBar = new LinearLayout(this);
@@ -206,16 +184,22 @@ public class MainActivity extends Activity implements NfcAdapter.ReaderCallback 
         root.addView(topBar);
 
         Button exitButton = new Button(this);
-        exitButton.setText("关闭 NFC 并退出软件");
+        exitButton.setText("停止读取并退出");
         exitButton.setAllCaps(false);
-        exitButton.setOnClickListener(v -> closeNfcAndExit());
+        exitButton.setOnClickListener(v -> exitApp());
         root.addView(exitButton, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(48)));
 
-        refreshButton = new Button(this);
+        Button refreshButton = new Button(this);
         refreshButton.setText("重新读取");
         refreshButton.setAllCaps(false);
-        refreshButton.setOnClickListener(v -> startNfcReading());
+        refreshButton.setOnClickListener(v -> startNfcReading(true));
         root.addView(refreshButton, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(48)));
+
+        Button nfcSettingsButton = new Button(this);
+        nfcSettingsButton.setText("打开系统 NFC 设置");
+        nfcSettingsButton.setAllCaps(false);
+        nfcSettingsButton.setOnClickListener(v -> openNfcSettings());
+        root.addView(nfcSettingsButton, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(48)));
 
         balanceText = new TextView(this);
         balanceText.setText("余额：等待读取");
@@ -293,10 +277,16 @@ public class MainActivity extends Activity implements NfcAdapter.ReaderCallback 
     }
 
     private void setStatus(String text) {
-        statusText.setText(text);
+        if (statusText != null) statusText.setText(text);
     }
 
     private int dp(int value) {
         return Math.round(getResources().getDisplayMetrics().density * value);
+    }
+
+    private int getStatusBarHeight() {
+        int resId = getResources().getIdentifier("status_bar_height", "dimen", "android");
+        if (resId > 0) return getResources().getDimensionPixelSize(resId);
+        return 0;
     }
 }

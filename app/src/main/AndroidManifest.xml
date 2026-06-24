@@ -6,7 +6,7 @@
 
     <application
         android:allowBackup="true"
-        android:label="Suica Auto Reader"
+        android:label="@string/app_name"
         android:theme="@style/AppTheme"
         android:resizeableActivity="true"
         android:supportsRtl="true">
@@ -18,19 +18,26 @@
         <activity
             android:name=".MainActivity"
             android:exported="true"
-            android:launchMode="singleTop">
+            android:launchMode="singleTask">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
 
-            <!-- 让系统在扫到 NFC-F / FeliCa 卡片时优先打开本 App -->
+            <!-- 系统 NFC App 选择器模式：扫到 Suica / FeliCa / NFC-F 时让本 App 出现在可选列表中 -->
             <intent-filter>
                 <action android:name="android.nfc.action.TECH_DISCOVERED" />
+                <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
             <meta-data
                 android:name="android.nfc.action.TECH_DISCOVERED"
                 android:resource="@xml/nfc_tech_filter" />
+
+            <!-- 部分 ROM 对未知标签只走 TAG_DISCOVERED，这里作为兜底，让 OPPO/ColorOS 更容易列出本 App -->
+            <intent-filter>
+                <action android:name="android.nfc.action.TAG_DISCOVERED" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
         </activity>
     </application>
 </manifest>

@@ -14,16 +14,21 @@ public class SuicaReader {
     private static final int SERVICE_CODE_HISTORY = 0x090F;
     private static final int MAX_HISTORY_BLOCKS = 20;
 
+    // 关键修复：不要一次读取 20 条。
+    // 20 条履历响应大约 333 bytes，很多手机/ROM/NFC 芯片会截断或直接返回异常短响应。
+    // 10 条响应约 173 bytes，兼容性明显更好；第二批再读 10 条。
+    private static final int HISTORY_BATCH_BLOCKS = 10;
+
     private SuicaReader() {}
 
     public static SuicaData read(Tag tag) throws Exception {
         NfcF nfcF = NfcF.get(tag);
         if (nfcF == null) throw new IOException("这不是 NFC-F / FeliCa 卡片");
 
-        byte[] idm = null;
+        byte[] idm;
         try {
             nfcF.connect();
-            nfcF.setTimeout(1200);
+            nfcF.setTimeout(3000);
 
             idm = polling(nfcF, SYSTEM_CODE_SUICA);
             if (idm == null || idm.length != 8) {
@@ -33,8 +38,8 @@ public class SuicaReader {
                 throw new IOException("无法取得 FeliCa IDm");
             }
 
-            byte[] response = readWithoutEncryption(nfcF, idm, SERVICE_CODE_HISTORY, MAX_HISTORY_BLOCKS);
-            return parseResponse(idm, response);
+            List<byte[]> blocks = readHistoryBlocks(nfcF, idm);
+            return parseBlocks(idm, blocks);
         } finally {
             try { nfcF.close(); } catch (Exception ignored) {}
         }
@@ -51,7 +56,7 @@ public class SuicaReader {
                 0x0f
         };
         try {
-            byte[] response = nfcF.transceive(command);
+            byte[] response = transceiveWithRetry(nfcF, command, 10, 2);
             if (response != null && response.length >= 10 && (response[1] & 0xff) == 0x01) {
                 return Arrays.copyOfRange(response, 2, 10);
             }
@@ -60,8 +65,51 @@ public class SuicaReader {
         return null;
     }
 
-    private static byte[] readWithoutEncryption(NfcF nfcF, byte[] idm, int serviceCode, int blockCount) throws IOException {
-        if (blockCount < 1 || blockCount > 20) throw new IllegalArgumentException("blockCount must be 1..20");
+    private static List<byte[]> readHistoryBlocks(NfcF nfcF, byte[] idm) throws IOException {
+        List<byte[]> blocks = new ArrayList<>();
+        IOException lastError = null;
+
+        for (int start = 0; start < MAX_HISTORY_BLOCKS; start += HISTORY_BATCH_BLOCKS) {
+            int count = Math.min(HISTORY_BATCH_BLOCKS, MAX_HISTORY_BLOCKS - start);
+            try {
+                byte[] response = readWithoutEncryption(nfcF, idm, SERVICE_CODE_HISTORY, start, count);
+                List<byte[]> batch = parseReadResponseToBlocks(response);
+                blocks.addAll(batch);
+                tinyDelay();
+            } catch (IOException e) {
+                lastError = e;
+
+                // 如果 10 条仍然失败，就退化成 1 条 1 条读取。
+                // 这样即使部分手机 NFC 栈比较挑，也能尽量至少拿到余额和近期几条。
+                for (int i = start; i < start + count; i++) {
+                    try {
+                        byte[] response = readWithoutEncryption(nfcF, idm, SERVICE_CODE_HISTORY, i, 1);
+                        List<byte[]> single = parseReadResponseToBlocks(response);
+                        blocks.addAll(single);
+                        tinyDelay();
+                    } catch (IOException singleError) {
+                        lastError = singleError;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (blocks.isEmpty()) {
+            if (lastError != null) throw lastError;
+            throw new IOException("没有读取到 Suica 公开履历块");
+        }
+        return blocks;
+    }
+
+    private static void tinyDelay() {
+        try { Thread.sleep(60); } catch (InterruptedException ignored) {}
+    }
+
+    private static byte[] readWithoutEncryption(NfcF nfcF, byte[] idm, int serviceCode, int startBlock, int blockCount) throws IOException {
+        if (blockCount < 1 || blockCount > 12) throw new IllegalArgumentException("blockCount must be 1..12");
+        if (startBlock < 0 || startBlock > 255) throw new IllegalArgumentException("startBlock must be 0..255");
+
         int length = 1 + 1 + 8 + 1 + 2 + 1 + blockCount * 2;
         byte[] command = new byte[length];
         int p = 0;
@@ -75,29 +123,64 @@ public class SuicaReader {
         command[p++] = (byte) blockCount;
         for (int i = 0; i < blockCount; i++) {
             command[p++] = (byte) 0x80; // 2-byte block list element, access mode 0
-            command[p++] = (byte) i;
+            command[p++] = (byte) (startBlock + i);
         }
-        return nfcF.transceive(command);
+        return transceiveWithRetry(nfcF, command, 13, 3);
     }
 
-    private static SuicaData parseResponse(byte[] idm, byte[] response) throws IOException {
-        if (response == null || response.length < 13) throw new IOException("FeliCa 响应过短");
-        if ((response[1] & 0xff) != 0x07) throw new IOException("不是 Read Without Encryption 响应：" + hex(response));
+    private static byte[] transceiveWithRetry(NfcF nfcF, byte[] command, int minResponseLength, int maxAttempts) throws IOException {
+        IOException lastError = null;
+        byte[] lastResponse = null;
+
+        for (int attempt = 0; attempt < maxAttempts; attempt++) {
+            try {
+                byte[] response = nfcF.transceive(command);
+                lastResponse = response;
+                if (response != null && response.length >= minResponseLength) {
+                    return response;
+                }
+                lastError = new IOException("FeliCa 响应过短 len=" + (response == null ? 0 : response.length)
+                        + " raw=" + hexShort(response));
+            } catch (IOException e) {
+                lastError = e;
+            }
+            try { Thread.sleep(120); } catch (InterruptedException ignored) {}
+        }
+
+        if (lastError != null) throw lastError;
+        throw new IOException("FeliCa 无响应 raw=" + hexShort(lastResponse));
+    }
+
+    private static List<byte[]> parseReadResponseToBlocks(byte[] response) throws IOException {
+        if (response == null || response.length < 13) {
+            throw new IOException("FeliCa 响应过短 len=" + (response == null ? 0 : response.length) + " raw=" + hexShort(response));
+        }
+        if ((response[1] & 0xff) != 0x07) {
+            throw new IOException("不是 Read Without Encryption 响应：" + hexShort(response));
+        }
 
         int status1 = response[10] & 0xff;
         int status2 = response[11] & 0xff;
         if (status1 != 0 || status2 != 0) {
-            throw new IOException(String.format(Locale.US, "Suica 公开履历读取被拒绝：status=%02X%02X", status1, status2));
+            throw new IOException(String.format(Locale.US, "Suica 公开履历读取被拒绝：status=%02X%02X raw=%s", status1, status2, hexShort(response)));
         }
 
         int blockCount = response[12] & 0xff;
         int available = Math.min(blockCount, (response.length - 13) / 16);
-        if (available <= 0) throw new IOException("没有可解析的履历块");
+        if (available <= 0) throw new IOException("没有可解析的履历块 raw=" + hexShort(response));
 
-        List<HistoryRecord> records = new ArrayList<>();
+        List<byte[]> blocks = new ArrayList<>();
         for (int i = 0; i < available; i++) {
             int start = 13 + i * 16;
-            byte[] block = Arrays.copyOfRange(response, start, start + 16);
+            blocks.add(Arrays.copyOfRange(response, start, start + 16));
+        }
+        return blocks;
+    }
+
+    private static SuicaData parseBlocks(byte[] idm, List<byte[]> blocks) throws IOException {
+        List<HistoryRecord> records = new ArrayList<>();
+        for (byte[] block : blocks) {
+            if (block == null || block.length != 16) continue;
             if (isAllZero(block)) continue;
             records.add(parseBlock(block));
         }
@@ -187,6 +270,13 @@ public class SuicaReader {
         StringBuilder sb = new StringBuilder(data.length * 2);
         for (byte b : data) sb.append(String.format(Locale.US, "%02X", b & 0xff));
         return sb.toString();
+    }
+
+    private static String hexShort(byte[] data) {
+        if (data == null) return "null";
+        int limit = Math.min(data.length, 64);
+        byte[] part = Arrays.copyOfRange(data, 0, limit);
+        return hex(part) + (data.length > limit ? "..." : "");
     }
 
     public static class SuicaData {

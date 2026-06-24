@@ -1,32 +1,24 @@
 # Suica Auto Reader
 
-一个极简 Android NFC-F / FeliCa 读取 Demo，用于读取实体 Suica / 交通系 IC 卡的公开余额和最近 20 条 SF 使用履历。
+极简 Android NFC-F / FeliCa / Suica 余额与公开履历读取 Demo。
 
-## 功能
+## v4 说明
 
-- 打开 App 后自动进入 NFC Reader Mode。
-- 扫到 Suica 后自动读取余额和最近 20 条公开履历。
-- 右上角三个点进入设置界面。
-- 三个点下方有“关闭 NFC 并退出软件”按钮。
-- 默认读取成功后暂停扫描，避免背贴卡一直反复触发。
-- 可选 root/系统权限模式：尝试执行 `su -c 'svc nfc enable/disable'` 自动开关 NFC。
+本版本改为“系统 NFC App 选择器模式”：
 
-## 重要限制
+1. 用户先在系统里手动开启 NFC。
+2. 手机扫到 Suica / FeliCa 标签时，系统弹出 App 选择器。
+3. 选择 `Suica Auto Reader`。
+4. App 从系统 Intent 中取得 `NfcAdapter.EXTRA_TAG`，然后重新读取余额和最近 20 条公开履历。
 
-普通第三方 Android App 不能直接打开或关闭系统 NFC 开关，只能检查 NFC 状态并跳转到系统 NFC 设置页。要真正自动开关 NFC，需要 root、系统签名、设备所有者/定制 ROM 等更高权限方案。
+普通第三方 App 不能直接打开或关闭系统 NFC 开关，所以 v4 不再尝试自动开关 NFC，也不再使用无障碍模拟点击 NFC 开关。
 
 ## 构建
 
-### GitHub Actions
+仓库已包含 `.github/workflows/android.yml`。上传到 GitHub 后进入 Actions，运行 `Android Build`，构建产物在 Artifacts 中。
 
-把本项目上传到 GitHub 后，进入 Actions，手动运行 `Android Build`。构建产物会在 Artifacts 里生成 debug APK。
+## 注意
 
-### 本地
-
-```bash
-gradle assembleDebug
-```
-
-## 说明
-
-本 App 只读卡，不写卡，不充值，不修改卡片内容。当前版本没有内置完整日本站名数据库，因此履历中显示的是原始线路/站点代码和 raw hex。
+- 只读取公开 SF 余额/履历，不写卡、不充值、不修改卡片。
+- 站名数据库未内置，目前显示线路/站点原始代码。
+- 如果选择 App 后提示读取失败，可以让卡片稍微离开 NFC 感应区再贴回，或点“重新读取”。
