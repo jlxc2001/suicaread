@@ -3,15 +3,19 @@ package com.jlxc.suicaautoreader;
 import android.app.Activity;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.graphics.Color;
 import android.graphics.Typeface;
+import android.graphics.drawable.ColorDrawable;
+import android.graphics.drawable.GradientDrawable;
 import android.nfc.NfcAdapter;
 import android.nfc.Tag;
 import android.os.Build;
 import android.os.Bundle;
 import android.provider.Settings;
 import android.view.Gravity;
-import android.widget.Button;
+import android.view.View;
 import android.widget.LinearLayout;
+import android.widget.PopupWindow;
 import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -23,15 +27,30 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public class MainActivity extends Activity implements NfcAdapter.ReaderCallback {
     private static final String PREFS = "suica_auto_reader_prefs";
     private static final String KEY_PAUSE_AFTER_READ = "pause_after_read";
+    private static final String KEY_SHOW_DEBUG = "show_debug";
+
+    private static final int BG = 0xFFF6F7F9;
+    private static final int CARD = 0xFFFFFFFF;
+    private static final int TEXT_MAIN = 0xFF101114;
+    private static final int TEXT_SUB = 0xFF777A80;
+    private static final int ACCENT = 0xFF06A9C8;
+    private static final int ACCENT_DARK = 0xFF007E93;
 
     private NfcAdapter nfcAdapter;
     private SharedPreferences prefs;
     private final AtomicBoolean reading = new AtomicBoolean(false);
 
+    private LinearLayout rootLayout;
     private TextView statusText;
     private TextView balanceText;
-    private TextView idmText;
+    private TextView updatedText;
     private LinearLayout historyList;
+    private LinearLayout debugBox;
+    private TextView debugText;
+
+    private volatile Tag lastTag;
+    private volatile SuicaReader.SuicaData lastData;
+    private String currentLang;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -39,6 +58,7 @@ public class MainActivity extends Activity implements NfcAdapter.ReaderCallback 
         prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
         ensureDefaultPrefs();
         nfcAdapter = NfcAdapter.getDefaultAdapter(this);
+        currentLang = L.lang(this);
         buildUi();
         handleIntent(getIntent(), true);
     }
@@ -53,7 +73,13 @@ public class MainActivity extends Activity implements NfcAdapter.ReaderCallback 
     @Override
     protected void onResume() {
         super.onResume();
+        String lang = L.lang(this);
+        if (currentLang == null || !currentLang.equals(lang)) {
+            currentLang = lang;
+            buildUi();
+        }
         startNfcReading(false);
+        if (lastData != null) renderSuicaData(lastData);
     }
 
     @Override
@@ -64,7 +90,7 @@ public class MainActivity extends Activity implements NfcAdapter.ReaderCallback 
 
     @Override
     public void onTagDiscovered(Tag tag) {
-        readTag(tag, "Reader Mode 已扫到卡片，正在读取 Suica 余额和履历…");
+        readTagAsync(tag, L.t(this, "status_detected"));
     }
 
     private void handleIntent(Intent intent, boolean fromSystemDispatch) {
@@ -73,58 +99,72 @@ public class MainActivity extends Activity implements NfcAdapter.ReaderCallback 
         if (tag != null) {
             String action = intent.getAction();
             String source = fromSystemDispatch
-                    ? "由系统 NFC 选择器启动：" + (action == null ? "" : action) + "。正在重新读取卡内数据…"
-                    : "正在读取卡内数据…";
-            readTag(tag, source);
+                    ? L.t(this, "status_from_chooser")
+                    : L.t(this, "status_reading");
+            readTagAsync(tag, source);
         }
     }
 
-    private void readTag(Tag tag, String message) {
+    private void readTagAsync(Tag tag, String message) {
         if (tag == null) return;
+        lastTag = tag;
         if (!reading.compareAndSet(false, true)) return;
         runOnUiThread(() -> setStatus(message));
-        try {
-            final SuicaReader.SuicaData data = SuicaReader.read(tag);
-            runOnUiThread(() -> {
-                renderSuicaData(data);
-                if (prefs.getBoolean(KEY_PAUSE_AFTER_READ, true)) {
-                    stopNfcReading();
-                    setStatus("读取完成。已暂停前台连续扫描。下次可以直接重新贴近/重新扫卡，在系统弹出的 App 选择器里选择本软件；也可以点“重新读取”。");
-                } else {
-                    setStatus("读取完成，继续等待下一次 NFC 扫描。下次从系统 App 选择器打开本软件时，也会自动重新读取。 ");
-                }
-            });
-        } catch (Exception e) {
-            runOnUiThread(() -> setStatus("读取失败：" + e.getMessage() + "\n\n可以点“重新读取”，或退出后重新扫卡，在系统弹出的 App 选择器里再次选择本软件。"));
-        } finally {
-            reading.set(false);
+        new Thread(() -> {
+            try {
+                final SuicaReader.SuicaData data = SuicaReader.read(tag);
+                lastData = data;
+                runOnUiThread(() -> {
+                    renderSuicaData(data);
+                    if (prefs.getBoolean(KEY_PAUSE_AFTER_READ, true)) {
+                        stopNfcReading();
+                        setStatus(L.t(this, "status_done"));
+                    } else {
+                        setStatus(L.t(this, "status_done_wait"));
+                    }
+                });
+            } catch (Exception e) {
+                runOnUiThread(() -> setStatus(L.t(this, "status_read_failed_prefix") + e.getMessage() + L.t(this, "status_read_failed_suffix")));
+            } finally {
+                reading.set(false);
+            }
+        }, "suica-read-thread").start();
+    }
+
+    private void forceRefresh() {
+        setStatus(L.t(this, "status_refreshing"));
+        if (lastTag != null) {
+            readTagAsync(lastTag, L.t(this, "status_refreshing_card"));
         }
+        startNfcReading(true);
     }
 
     private void startNfcReading(boolean userRequested) {
         if (nfcAdapter == null) {
-            setStatus("这台设备没有 NFC 硬件，无法读取 Suica。");
+            setStatus(L.t(this, "status_no_nfc_hw"));
             return;
         }
 
         if (!nfcAdapter.isEnabled()) {
-            setStatus("NFC 当前关闭。普通第三方 App 不能直接打开 NFC。\n\n本版本采用系统选择器模式：请先手动打开 NFC；之后扫到背后的 Suica 时，在系统弹出的 App 选择器里选择 Suica Auto Reader，本软件会收到系统传入的卡片对象并重新读取余额/履历。");
+            setStatus(L.t(this, "status_nfc_off"));
             if (userRequested) openNfcSettings();
             return;
         }
 
         Bundle extras = new Bundle();
         extras.putInt(NfcAdapter.EXTRA_READER_PRESENCE_CHECK_DELAY, 250);
-        int flags = NfcAdapter.FLAG_READER_NFC_F | NfcAdapter.FLAG_READER_SKIP_NDEF_CHECK;
+        int flags = NfcAdapter.FLAG_READER_NFC_F
+                | NfcAdapter.FLAG_READER_SKIP_NDEF_CHECK
+                | NfcAdapter.FLAG_READER_NO_PLATFORM_SOUNDS;
         try {
             nfcAdapter.enableReaderMode(this, this, flags, extras);
             if (userRequested) {
-                setStatus("已重新进入前台读取模式。请保持 Suica 靠近手机 NFC 感应区；如果没有反应，可以稍微移开再贴回。 ");
-            } else {
-                setStatus("等待 NFC：你也可以直接从系统 NFC App 选择器启动本软件，启动后会自动读取系统传入的 Suica 标签。 ");
+                setStatus(L.t(this, "status_reader_mode"));
+            } else if (lastData == null) {
+                setStatus(L.t(this, "status_wait_nfc"));
             }
         } catch (Exception e) {
-            setStatus("启动 NFC Reader Mode 失败：" + e.getMessage());
+            setStatus(L.t(this, "status_reader_failed") + e.getMessage());
         }
     }
 
@@ -146,7 +186,7 @@ public class MainActivity extends Activity implements NfcAdapter.ReaderCallback 
 
     private void exitApp() {
         stopNfcReading();
-        Toast.makeText(this, "已退出，不关闭系统 NFC", Toast.LENGTH_SHORT).show();
+        Toast.makeText(this, L.t(this, "toast_exit"), Toast.LENGTH_SHORT).show();
         if (Build.VERSION.SDK_INT >= 21) finishAndRemoveTask();
         else finish();
     }
@@ -155,129 +195,353 @@ public class MainActivity extends Activity implements NfcAdapter.ReaderCallback 
         if (!prefs.contains(KEY_PAUSE_AFTER_READ)) {
             prefs.edit().putBoolean(KEY_PAUSE_AFTER_READ, true).apply();
         }
+        if (!prefs.contains(KEY_SHOW_DEBUG)) {
+            prefs.edit().putBoolean(KEY_SHOW_DEBUG, false).apply();
+        }
     }
 
     private void buildUi() {
-        int pad = dp(16);
-        LinearLayout root = new LinearLayout(this);
-        root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(pad, dp(10) + getStatusBarHeight(), pad, pad);
-        root.setBackgroundColor(0xFFF7F8FA);
+        int pad = dp(14);
+        rootLayout = new LinearLayout(this);
+        rootLayout.setOrientation(LinearLayout.VERTICAL);
+        rootLayout.setPadding(pad, dp(8) + getStatusBarHeight(), pad, 0);
+        rootLayout.setBackgroundColor(BG);
 
         LinearLayout topBar = new LinearLayout(this);
         topBar.setOrientation(LinearLayout.HORIZONTAL);
         topBar.setGravity(Gravity.CENTER_VERTICAL);
+        topBar.setPadding(0, 0, 0, dp(8));
+
+        TextView menu = new TextView(this);
+        menu.setText("⋮");
+        menu.setTextSize(25);
+        menu.setGravity(Gravity.CENTER);
+        menu.setTextColor(TEXT_MAIN);
+        menu.setBackground(makeRoundBg(0x00FFFFFF, dp(18)));
+        menu.setOnClickListener(v -> showDrawer(menu));
+        topBar.addView(menu, new LinearLayout.LayoutParams(dp(38), dp(38)));
 
         TextView title = new TextView(this);
-        title.setText("Suica Auto Reader");
-        title.setTextSize(22);
+        title.setText(L.t(this, "app_short_title"));
+        title.setTextSize(20);
         title.setTypeface(Typeface.DEFAULT_BOLD);
-        title.setTextColor(0xFF111111);
-        topBar.addView(title, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        title.setTextColor(TEXT_MAIN);
+        LinearLayout.LayoutParams titleLp = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+        titleLp.setMargins(dp(8), 0, 0, 0);
+        topBar.addView(title, titleLp);
 
-        Button menu = new Button(this);
-        menu.setText("⋮");
-        menu.setTextSize(22);
-        menu.setAllCaps(false);
-        menu.setOnClickListener(v -> startActivity(new Intent(this, SettingsActivity.class)));
-        topBar.addView(menu, new LinearLayout.LayoutParams(dp(52), dp(48)));
-        root.addView(topBar);
+        TextView nfcHint = new TextView(this);
+        nfcHint.setText("NFC");
+        nfcHint.setTextSize(12);
+        nfcHint.setGravity(Gravity.CENTER);
+        nfcHint.setTextColor(ACCENT_DARK);
+        nfcHint.setTypeface(Typeface.DEFAULT_BOLD);
+        nfcHint.setBackground(makeRoundBg(0xFFE9FBFE, dp(16)));
+        topBar.addView(nfcHint, new LinearLayout.LayoutParams(dp(54), dp(30)));
+        rootLayout.addView(topBar);
 
-        Button exitButton = new Button(this);
-        exitButton.setText("停止读取并退出");
-        exitButton.setAllCaps(false);
-        exitButton.setOnClickListener(v -> exitApp());
-        root.addView(exitButton, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(48)));
+        LinearLayout balanceCard = new LinearLayout(this);
+        balanceCard.setOrientation(LinearLayout.VERTICAL);
+        balanceCard.setPadding(dp(18), dp(16), dp(18), dp(14));
+        balanceCard.setBackground(makeRoundBg(CARD, dp(18)));
 
-        Button refreshButton = new Button(this);
-        refreshButton.setText("重新读取");
-        refreshButton.setAllCaps(false);
-        refreshButton.setOnClickListener(v -> startNfcReading(true));
-        root.addView(refreshButton, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(48)));
-
-        Button nfcSettingsButton = new Button(this);
-        nfcSettingsButton.setText("打开系统 NFC 设置");
-        nfcSettingsButton.setAllCaps(false);
-        nfcSettingsButton.setOnClickListener(v -> openNfcSettings());
-        root.addView(nfcSettingsButton, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(48)));
+        TextView balanceLabel = new TextView(this);
+        balanceLabel.setText(L.t(this, "balance"));
+        balanceLabel.setTextSize(17);
+        balanceLabel.setTextColor(TEXT_MAIN);
+        balanceCard.addView(balanceLabel);
 
         balanceText = new TextView(this);
-        balanceText.setText("余额：等待读取");
+        balanceText.setText(L.t(this, "waiting_read"));
         balanceText.setTextSize(34);
         balanceText.setTypeface(Typeface.DEFAULT_BOLD);
-        balanceText.setTextColor(0xFF0B6F68);
-        balanceText.setPadding(0, dp(18), 0, dp(4));
-        root.addView(balanceText);
+        balanceText.setTextColor(TEXT_MAIN);
+        balanceText.setPadding(0, dp(4), 0, dp(4));
+        balanceCard.addView(balanceText);
 
-        idmText = new TextView(this);
-        idmText.setText("IDm：-");
-        idmText.setTextSize(13);
-        idmText.setTextColor(0xFF666666);
-        root.addView(idmText);
+        updatedText = new TextView(this);
+        updatedText.setText(L.t(this, "scan_suica"));
+        updatedText.setTextSize(16);
+        updatedText.setTypeface(Typeface.DEFAULT_BOLD);
+        updatedText.setTextColor(ACCENT_DARK);
+        balanceCard.addView(updatedText);
+
+        LinearLayout.LayoutParams balanceLp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        balanceLp.setMargins(0, 0, 0, dp(12));
+        rootLayout.addView(balanceCard, balanceLp);
 
         statusText = new TextView(this);
-        statusText.setText("正在初始化 NFC…");
-        statusText.setTextSize(14);
-        statusText.setTextColor(0xFF333333);
-        statusText.setPadding(0, dp(12), 0, dp(12));
-        root.addView(statusText);
+        statusText.setText(L.t(this, "initializing"));
+        statusText.setTextSize(13);
+        statusText.setTextColor(TEXT_SUB);
+        statusText.setPadding(dp(2), 0, dp(2), dp(10));
+        rootLayout.addView(statusText);
+
+        debugBox = new LinearLayout(this);
+        debugBox.setOrientation(LinearLayout.VERTICAL);
+        debugBox.setPadding(dp(12), dp(10), dp(12), dp(10));
+        debugBox.setBackground(makeRoundBg(0xFFEFF2F5, dp(12)));
+        debugText = new TextView(this);
+        debugText.setTextSize(12);
+        debugText.setTextColor(0xFF555A60);
+        debugBox.addView(debugText);
+        rootLayout.addView(debugBox, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+        debugBox.setVisibility(View.GONE);
 
         ScrollView scroll = new ScrollView(this);
         historyList = new LinearLayout(this);
         historyList.setOrientation(LinearLayout.VERTICAL);
         scroll.addView(historyList);
-        root.addView(scroll, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
+        rootLayout.addView(scroll, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
 
-        setContentView(root);
+        setContentView(rootLayout);
+        renderEmptyState();
+    }
+
+    private void showDrawer(View anchor) {
+        LinearLayout panel = new LinearLayout(this);
+        panel.setOrientation(LinearLayout.VERTICAL);
+        panel.setPadding(dp(12), dp(12), dp(12), dp(12));
+        panel.setBackground(makeRoundBg(CARD, dp(18)));
+
+        TextView header = new TextView(this);
+        header.setText(L.t(this, "drawer_title"));
+        header.setTextSize(18);
+        header.setTypeface(Typeface.DEFAULT_BOLD);
+        header.setTextColor(TEXT_MAIN);
+        header.setPadding(dp(6), dp(4), dp(6), dp(8));
+        panel.addView(header);
+
+        panel.addView(drawerItem(L.t(this, "refresh"), L.t(this, "refresh_desc"), () -> forceRefresh()));
+        panel.addView(drawerItem(L.t(this, "open_nfc_settings"), L.t(this, "open_nfc_settings_desc"), () -> openNfcSettings()));
+        panel.addView(drawerItem(L.t(this, "settings"), L.t(this, "settings_desc"), () -> startActivity(new Intent(this, SettingsActivity.class))));
+        panel.addView(drawerItem(L.t(this, "exit"), L.t(this, "exit_desc"), () -> exitApp()));
+
+        final PopupWindow popup = new PopupWindow(panel, dp(286), LinearLayout.LayoutParams.WRAP_CONTENT, true);
+        popup.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+        popup.setOutsideTouchable(true);
+        if (Build.VERSION.SDK_INT >= 21) popup.setElevation(dp(10));
+
+        // 让点击菜单项后自动收起
+        int childCount = panel.getChildCount();
+        for (int i = 1; i < childCount; i++) {
+            final View item = panel.getChildAt(i);
+            final View.OnClickListener original = getStoredClick(item);
+            if (original != null) {
+                item.setOnClickListener(v -> {
+                    popup.dismiss();
+                    original.onClick(v);
+                });
+            }
+        }
+        popup.showAtLocation(rootLayout, Gravity.TOP | Gravity.START, dp(10), getStatusBarHeight() + dp(48));
+    }
+
+    private View.OnClickListener getStoredClick(View item) {
+        Object tag = item.getTag();
+        if (tag instanceof View.OnClickListener) return (View.OnClickListener) tag;
+        return null;
+    }
+
+    private LinearLayout drawerItem(String title, String desc, final Runnable action) {
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(dp(10), dp(10), dp(10), dp(10));
+        box.setBackground(makeRoundBg(0xFFF8F9FA, dp(12)));
+        box.setTag((View.OnClickListener) v -> action.run());
+        box.setOnClickListener((View.OnClickListener) box.getTag());
+
+        TextView t = new TextView(this);
+        t.setText(title);
+        t.setTextSize(15);
+        t.setTypeface(Typeface.DEFAULT_BOLD);
+        t.setTextColor(TEXT_MAIN);
+        box.addView(t);
+
+        TextView d = new TextView(this);
+        d.setText(desc);
+        d.setTextSize(12);
+        d.setTextColor(TEXT_SUB);
+        d.setPadding(0, dp(2), 0, 0);
+        box.addView(d);
+
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        lp.setMargins(0, 0, 0, dp(8));
+        box.setLayoutParams(lp);
+        return box;
+    }
+
+    private void renderEmptyState() {
+        historyList.removeAllViews();
+        TextView empty = new TextView(this);
+        empty.setText(L.t(this, "empty_state"));
+        empty.setTextSize(15);
+        empty.setTextColor(TEXT_SUB);
+        empty.setGravity(Gravity.CENTER);
+        empty.setPadding(dp(18), dp(42), dp(18), dp(42));
+        historyList.addView(empty, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
     }
 
     private void renderSuicaData(SuicaReader.SuicaData data) {
         NumberFormat yen = NumberFormat.getCurrencyInstance(Locale.JAPAN);
         yen.setMaximumFractionDigits(0);
-        balanceText.setText("余额：" + yen.format(data.balanceYen));
-        idmText.setText("IDm：" + data.idmHex + "    System：0x0003    Records：" + data.records.size());
+        balanceText.setText(normalizeYen(yen.format(data.balanceYen)));
+        updatedText.setText(L.f(this, "updated_fmt", data.records.size()));
         historyList.removeAllViews();
+
+        boolean showDebug = prefs.getBoolean(KEY_SHOW_DEBUG, false);
+        if (showDebug) {
+            debugBox.setVisibility(View.VISIBLE);
+            debugText.setText(L.f(this, "debug_fmt", data.idmHex, data.records.size()));
+        } else {
+            debugBox.setVisibility(View.GONE);
+        }
 
         for (int i = 0; i < data.records.size(); i++) {
             SuicaReader.HistoryRecord r = data.records.get(i);
-            Integer delta = null;
+            Integer change = null;
             if (i + 1 < data.records.size()) {
-                delta = r.balanceYen - data.records.get(i + 1).balanceYen;
+                change = r.balanceYen - data.records.get(i + 1).balanceYen;
             }
-
-            LinearLayout card = new LinearLayout(this);
-            card.setOrientation(LinearLayout.VERTICAL);
-            card.setPadding(dp(14), dp(12), dp(14), dp(12));
-            card.setBackgroundColor(0xFFFFFFFF);
-
-            TextView line1 = new TextView(this);
-            line1.setText(String.format(Locale.JAPAN, "#%02d  %s    余额 %s", i + 1, r.dateText, yen.format(r.balanceYen)));
-            line1.setTextSize(17);
-            line1.setTypeface(Typeface.DEFAULT_BOLD);
-            line1.setTextColor(0xFF111111);
-            card.addView(line1);
-
-            TextView line2 = new TextView(this);
-            String deltaText = delta == null ? "未知" : (delta >= 0 ? "+" : "") + yen.format(delta).replace("￥", "¥");
-            line2.setText("类型：" + r.machineText + " / " + r.processText + "    推算变化：" + deltaText);
-            line2.setTextSize(14);
-            line2.setTextColor(0xFF333333);
-            card.addView(line2);
-
-            TextView line3 = new TextView(this);
-            line3.setText("入场/出场代码：" + r.areaLineStationText + "    Seq：" + r.sequence + "    Raw：" + r.rawHex);
-            line3.setTextSize(12);
-            line3.setTextColor(0xFF666666);
-            card.addView(line3);
-
-            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-            lp.setMargins(0, 0, 0, dp(10));
-            historyList.addView(card, lp);
+            historyList.addView(makeHistoryRow(r, change, yen, showDebug), rowLp());
         }
+    }
+
+    private LinearLayout makeHistoryRow(SuicaReader.HistoryRecord r, Integer change, NumberFormat yen, boolean showDebug) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.VERTICAL);
+        row.setPadding(dp(12), dp(12), dp(12), dp(12));
+        row.setBackground(makeRoundBg(CARD, dp(14)));
+
+        LinearLayout top = new LinearLayout(this);
+        top.setOrientation(LinearLayout.HORIZONTAL);
+        top.setGravity(Gravity.CENTER_VERTICAL);
+
+        TextView icon = new TextView(this);
+        icon.setText(iconText(r, change));
+        icon.setTextSize(24);
+        icon.setGravity(Gravity.CENTER);
+        icon.setTextColor(Color.WHITE);
+        icon.setTypeface(Typeface.DEFAULT_BOLD);
+        icon.setBackground(makeRoundBg(ACCENT, dp(12)));
+        LinearLayout.LayoutParams iconLp = new LinearLayout.LayoutParams(dp(52), dp(52));
+        top.addView(icon, iconLp);
+
+        LinearLayout left = new LinearLayout(this);
+        left.setOrientation(LinearLayout.VERTICAL);
+        left.setPadding(dp(12), 0, dp(8), 0);
+
+        TextView title = new TextView(this);
+        title.setText(friendlyTitle(r, change));
+        title.setTextSize(17);
+        title.setTypeface(Typeface.DEFAULT_BOLD);
+        title.setTextColor(TEXT_MAIN);
+        left.addView(title);
+
+        TextView date = new TextView(this);
+        date.setText(shortDate(r.dateText));
+        date.setTextSize(15);
+        date.setTextColor(TEXT_MAIN);
+        date.setPadding(0, dp(2), 0, 0);
+        left.addView(date);
+        top.addView(left, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+
+        TextView place = new TextView(this);
+        place.setText(friendlyPlace(r, change));
+        place.setTextSize(14);
+        place.setTextColor(TEXT_MAIN);
+        place.setGravity(Gravity.CENTER_VERTICAL);
+        top.addView(place, new LinearLayout.LayoutParams(dp(72), LinearLayout.LayoutParams.WRAP_CONTENT));
+
+        TextView amount = new TextView(this);
+        amount.setText(amountText(r, change, yen));
+        amount.setTextSize(22);
+        amount.setTypeface(Typeface.DEFAULT_BOLD);
+        amount.setTextColor(TEXT_MAIN);
+        amount.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
+        top.addView(amount, new LinearLayout.LayoutParams(dp(118), LinearLayout.LayoutParams.WRAP_CONTENT));
+
+        TextView arrow = new TextView(this);
+        arrow.setText("›");
+        arrow.setTextSize(28);
+        arrow.setTextColor(0xFFB4B7BB);
+        arrow.setGravity(Gravity.CENTER);
+        top.addView(arrow, new LinearLayout.LayoutParams(dp(20), LinearLayout.LayoutParams.WRAP_CONTENT));
+        row.addView(top);
+
+        if (showDebug) {
+            TextView debug = new TextView(this);
+            debug.setText(L.f(this, "debug_line_fmt", normalizeYen(yen.format(r.balanceYen)), r.machineText, r.processText, r.areaLineStationText, r.sequence, r.rawHex));
+            debug.setTextSize(11);
+            debug.setTextColor(TEXT_SUB);
+            debug.setPadding(dp(64), dp(8), 0, 0);
+            row.addView(debug);
+        }
+        return row;
+    }
+
+    private LinearLayout.LayoutParams rowLp() {
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        lp.setMargins(0, 0, 0, dp(8));
+        return lp;
+    }
+
+    private String friendlyTitle(SuicaReader.HistoryRecord r, Integer change) {
+        if (change != null && change > 0) return L.t(this, "charge_amount");
+        if (r.processCode == 0x02 || r.processCode == 0x14 || r.machineCode == 0x09 || r.machineCode == 0x1F) return L.t(this, "charge_amount");
+        if (r.machineCode == 0x07 || r.processCode == 0x03) return L.t(this, "ticket_purchase");
+        if (r.machineCode == 0x05 || r.machineCode == 0x08 || r.processCode == 0x01 || r.processCode == 0x0d || r.processCode == 0x0f) return L.t(this, "public_transport");
+        if (r.machineCode == 0xC7 || r.machineCode == 0xC8 || r.processCode == 0x46) return L.t(this, "purchase");
+        if (change != null && change < 0) return L.t(this, "purchase");
+        return L.t(this, "record");
+    }
+
+    private String friendlyPlace(SuicaReader.HistoryRecord r, Integer change) {
+        if (change != null && change > 0) return L.t(this, "charge");
+        if (r.processCode == 0x02 || r.processCode == 0x14 || r.machineCode == 0x09 || r.machineCode == 0x1F) return L.t(this, "charge");
+        if (r.machineCode == 0x07) return L.t(this, "station");
+        if (r.machineCode == 0x05 || r.machineCode == 0x08 || r.processCode == 0x01 || r.processCode == 0x0d || r.processCode == 0x0f) return L.t(this, "transport");
+        if (r.machineCode == 0xC7 || r.machineCode == 0xC8 || r.processCode == 0x46) return L.t(this, "wallet");
+        return "";
+    }
+
+    private String iconText(SuicaReader.HistoryRecord r, Integer change) {
+        if (change != null && change > 0) return "+";
+        if (r.processCode == 0x02 || r.processCode == 0x14 || r.machineCode == 0x09 || r.machineCode == 0x1F) return "+";
+        if (r.machineCode == 0x07 || r.processCode == 0x03) return "券";
+        if (r.machineCode == 0x05 || r.machineCode == 0x08 || r.processCode == 0x01 || r.processCode == 0x0d || r.processCode == 0x0f) return "電";
+        return "買";
+    }
+
+    private String amountText(SuicaReader.HistoryRecord r, Integer change, NumberFormat yen) {
+        if (change == null) return normalizeYen(yen.format(r.balanceYen));
+        String s = normalizeYen(yen.format(Math.abs(change)));
+        if (change > 0) return "+" + s;
+        if (change < 0) return s;
+        return s;
+    }
+
+    private String shortDate(String full) {
+        if (full != null && full.length() >= 10 && full.charAt(4) == '/') {
+            return full.substring(5);
+        }
+        return full == null ? "" : full;
+    }
+
+    private String normalizeYen(String s) {
+        if (s == null) return "";
+        return s.replace('￥', '¥');
     }
 
     private void setStatus(String text) {
         if (statusText != null) statusText.setText(text);
+    }
+
+    private GradientDrawable makeRoundBg(int color, int radius) {
+        GradientDrawable d = new GradientDrawable();
+        d.setColor(color);
+        d.setCornerRadius(radius);
+        return d;
     }
 
     private int dp(int value) {

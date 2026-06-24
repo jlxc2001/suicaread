@@ -240,6 +240,7 @@ public class SuicaReader {
             case 0x09: return "入金机/充值机";
             case 0x12: return "自动贩卖机";
             case 0x14: return "站务终端";
+            case 0x1f: return "充值/终端处理";
             case 0xc7: return "物贩/电子钱包";
             case 0xc8: return "物贩/电子钱包";
             default: return String.format(Locale.US, "设备0x%02X", code);
